@@ -71,6 +71,57 @@ def _get_user_plugins_dir() -> Optional[Path]:
         return None
 
 
+def _get_root_plugins_dir() -> Optional[Path]:
+    """Return the root Hermes home ``plugins/`` dir, or None.
+
+    In profile mode ``$HERMES_HOME`` is ``<root>/profiles/<name>``, so a
+    plugin installed at the root home (``~/.hermes/plugins/``) would be
+    invisible to ``_get_user_plugins_dir()``.  This helper resolves the
+    *root* home via ``get_default_hermes_root()`` — which already handles
+    standard, Docker, and profile layouts — and returns its ``plugins/``
+    subdirectory when it exists and differs from the profile-scoped dir.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        root = get_default_hermes_root() / "plugins"
+        profile_dir = _get_user_plugins_dir()
+        if not root.is_dir():
+            return None
+        # Avoid duplicating the profile-scoped scan when root == profile
+        # (default profile, or non-profile deployments).
+        try:
+            if profile_dir is not None and root.resolve() == profile_dir.resolve():
+                return None
+        except OSError:
+            pass
+        return root
+    except Exception:
+        return None
+
+
+def _user_plugin_search_dirs() -> List[Path]:
+    """Ordered user plugin search dirs: profile-scoped first, then root.
+
+    Both are optional; only existing directories are returned.  Bundled
+    providers (``plugins/memory/``) are always scanned first and take
+    precedence — see ``_iter_provider_dirs()``.
+    """
+    dirs: List[Path] = []
+    seen_resolved: set = set()
+    for d in (_get_user_plugins_dir(), _get_root_plugins_dir()):
+        if d is None:
+            continue
+        try:
+            key = str(d.resolve())
+        except OSError:
+            key = str(d)
+        if key in seen_resolved:
+            continue
+        seen_resolved.add(key)
+        dirs.append(d)
+    return dirs
+
+
 def _is_memory_provider_dir(path: Path) -> bool:
     """Heuristic: does *path* look like a memory provider plugin?
 
@@ -106,16 +157,20 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
             seen.add(child.name)
             dirs.append((child.name, child))
 
-    # 2. User-installed providers ($HERMES_HOME/plugins/<name>/)
-    user_dir = _get_user_plugins_dir()
-    if user_dir:
+    # 2. User-installed providers.
+    # Scan profile-scoped dir first, then root home plugins/ as a fallback.
+    # This closes the profile gap: a plugin installed at ~/.hermes/plugins/
+    # (root home) is found even when $HERMES_HOME is ~/.hermes/profiles/<name>.
+    # Bundled providers always take precedence on name collisions.
+    for user_dir in _user_plugin_search_dirs():
         for child in sorted(user_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
             if child.name in seen:
-                continue  # bundled takes precedence
+                continue  # bundled / earlier dir takes precedence
             if not _is_memory_provider_dir(child):
                 continue  # skip non-memory plugins
+            seen.add(child.name)
             dirs.append((child.name, child))
 
     return dirs
@@ -124,15 +179,14 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
 def find_provider_dir(name: str) -> Optional[Path]:
     """Resolve a provider name to its directory.
 
-    Checks bundled first, then user-installed.
+    Checks bundled first, then user-installed (profile-scoped, then root).
     """
     # Bundled
     bundled = _MEMORY_PLUGINS_DIR / name
     if bundled.is_dir() and (bundled / "__init__.py").exists():
         return bundled
-    # User-installed
-    user_dir = _get_user_plugins_dir()
-    if user_dir:
+    # User-installed: profile-scoped first, then root home fallback.
+    for user_dir in _user_plugin_search_dirs():
         user = user_dir / name
         if user.is_dir() and _is_memory_provider_dir(user):
             return user

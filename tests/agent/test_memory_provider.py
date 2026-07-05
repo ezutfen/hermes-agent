@@ -607,6 +607,159 @@ class TestUserInstalledProviderDiscovery:
         assert p.name == "nestedimpl"
 
 
+class TestRootHomePluginFallback:
+    """Plugins installed at the root home are found in profile mode.
+
+    Regression test: when ``$HERMES_HOME`` is ``<root>/profiles/<name>``,
+    ``_get_user_plugins_dir()`` points at the profile-scoped ``plugins/``
+    dir, so a plugin installed at the *root* home (``~/.hermes/plugins/``)
+    was invisible — ``load_memory_provider()`` returned None and the
+    provider silently fell back to built-in memory only.  Discovery now
+    also scans the root home via ``_get_root_plugins_dir()``.
+    """
+
+    def _make_user_memory_plugin(self, parent, name="rootprovider"):
+        """Create a minimal memory provider plugin under ``parent/plugins``."""
+        plugin_dir = parent / "plugins" / name
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text(
+            "from agent.memory_provider import MemoryProvider\n"
+            "class MyProvider(MemoryProvider):\n"
+            "    @property\n"
+            f"    def name(self): return {name!r}\n"
+            "    def is_available(self): return True\n"
+            "    def initialize(self, **kw): pass\n"
+            "    def sync_turn(self, *a, **kw): pass\n"
+            "    def get_tool_schemas(self): return []\n"
+            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
+        )
+        (plugin_dir / "plugin.yaml").write_text(
+            f"name: {name}\ndescription: Test root-home provider\n"
+        )
+        return plugin_dir
+
+    def test_find_provider_dir_falls_back_to_root(self, tmp_path, monkeypatch):
+        """find_provider_dir() finds a plugin at the root home when the
+        profile-scoped plugins dir does not contain it."""
+        from plugins.memory import find_provider_dir
+
+        root_home = tmp_path / "root"
+        profile_home = tmp_path / "root" / "profiles" / "myprofile"
+        profile_home.mkdir(parents=True)
+        self._make_user_memory_plugin(root_home, "rootprovider")
+
+        # Profile-scoped plugins dir does NOT exist; root does.
+        monkeypatch.setattr(
+            "plugins.memory._get_user_plugins_dir", lambda: None
+        )
+        monkeypatch.setattr(
+            "plugins.memory._get_root_plugins_dir",
+            lambda: root_home / "plugins",
+        )
+        found = find_provider_dir("rootprovider")
+        assert found is not None
+        assert found.name == "rootprovider"
+        assert found.parent == (root_home / "plugins").resolve() or \
+            found.parent == root_home / "plugins"
+
+    def test_discover_includes_root_provider(self, tmp_path, monkeypatch):
+        """discover_memory_providers() includes root-home providers."""
+        from plugins.memory import discover_memory_providers
+
+        root_home = tmp_path / "root"
+        self._make_user_memory_plugin(root_home, "rootprovider")
+        monkeypatch.setattr(
+            "plugins.memory._get_user_plugins_dir", lambda: None
+        )
+        monkeypatch.setattr(
+            "plugins.memory._get_root_plugins_dir",
+            lambda: root_home / "plugins",
+        )
+        names = [n for n, _, _ in discover_memory_providers()]
+        assert "rootprovider" in names
+        assert "holographic" in names  # bundled still found
+
+    def test_load_provider_from_root(self, tmp_path, monkeypatch):
+        """load_memory_provider() returns an instance from the root home."""
+        from plugins.memory import load_memory_provider
+
+        root_home = tmp_path / "root"
+        self._make_user_memory_plugin(root_home, "rootprovider")
+        monkeypatch.setattr(
+            "plugins.memory._get_user_plugins_dir", lambda: None
+        )
+        monkeypatch.setattr(
+            "plugins.memory._get_root_plugins_dir",
+            lambda: root_home / "plugins",
+        )
+        p = load_memory_provider("rootprovider")
+        assert p is not None
+        assert p.name == "rootprovider"
+        assert p.is_available()
+
+    def test_profile_plugin_takes_precedence_over_root(self, tmp_path, monkeypatch):
+        """When a plugin exists in BOTH profile and root, profile wins."""
+        from plugins.memory import find_provider_dir, load_memory_provider
+
+        root_home = tmp_path / "root"
+        profile_home = tmp_path / "root" / "profiles" / "myprofile"
+        profile_plugins = profile_home / "plugins"
+        profile_plugins.mkdir(parents=True)
+
+        # Root version
+        self._make_user_memory_plugin(root_home, "shared")
+        # Profile version (different identifiable name)
+        (profile_plugins / "shared").mkdir(parents=True)
+        (profile_plugins / "shared" / "__init__.py").write_text(
+            "from agent.memory_provider import MemoryProvider\n"
+            "class ProfileProvider(MemoryProvider):\n"
+            "    @property\n"
+            "    def name(self): return 'shared-PROFILE'\n"
+            "    def is_available(self): return True\n"
+            "    def initialize(self, **kw): pass\n"
+            "    def sync_turn(self, *a, **kw): pass\n"
+            "    def get_tool_schemas(self): return []\n"
+            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
+        )
+        (profile_plugins / "shared" / "plugin.yaml").write_text(
+            "name: shared\ndescription: profile version\n"
+        )
+
+        monkeypatch.setattr(
+            "plugins.memory._get_user_plugins_dir", lambda: profile_plugins
+        )
+        monkeypatch.setattr(
+            "plugins.memory._get_root_plugins_dir",
+            lambda: root_home / "plugins",
+        )
+        found = find_provider_dir("shared")
+        assert found is not None
+        assert found.parent == profile_plugins.resolve() or \
+            found.parent == profile_plugins
+        p = load_memory_provider("shared")
+        assert p.name == "shared-PROFILE"  # profile version, not root
+
+    def test_root_equals_profile_no_duplicate(self, tmp_path, monkeypatch):
+        """When root and profile resolve to the same dir (default profile),
+        the provider is not discovered twice."""
+        from plugins.memory import discover_memory_providers
+
+        home = tmp_path / "home"
+        self._make_user_memory_plugin(home, "rootprovider")
+        shared_dir = home / "plugins"
+
+        # Both helpers return the same dir — _user_plugin_search_dirs()
+        # should deduplicate so no double-load happens.
+        monkeypatch.setattr(
+            "plugins.memory._get_user_plugins_dir", lambda: shared_dir
+        )
+        monkeypatch.setattr(
+            "plugins.memory._get_root_plugins_dir", lambda: shared_dir
+        )
+        names = [n for n, _, _ in discover_memory_providers()]
+        assert names.count("rootprovider") == 1
+
+
 class TestUserInstalledProviderCli:
     """CLI commands of user-installed providers must be discoverable.
 
