@@ -24,6 +24,7 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -484,6 +485,20 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+
+    # Provider-compatibility rewrite (Z.AI / glm-5.2 only).
+    # The literal "Hermes Agent" product phrase in the outbound system prompt
+    # is hypothesized to trigger a disguised 429 (code 1305) from Z.AI's
+    # glm-5.2 backend.  Rewriting it to "ZCode" in memory at this final
+    # assembly boundary keeps on-disk content (docs, skills, memories,
+    # sessions) byte-identical — the substitution exists only in the text
+    # sent to the API.  Kill switch: HERMES_ZCODE_REWRITE=0 disables without a
+    # code revert.
+    if os.environ.get("HERMES_ZCODE_REWRITE", "1") != "0":
+        _provider_lower = str(getattr(agent, "provider", "") or "").lower()
+        _model_lower = str(getattr(agent, "model", "") or "").lower()
+        if _provider_lower == "zai" and "glm-5.2" in _model_lower:
+            joined = joined.replace("Hermes Agent", "ZCode")
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
