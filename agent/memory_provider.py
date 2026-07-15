@@ -83,21 +83,43 @@ class MemoryProvider(ABC):
         """
 
     def system_prompt_block(self) -> str:
-        """Return text to include in the system prompt.
+        """Return STATIC text to include verbatim in the system prompt.
 
         Called during system prompt assembly. Return empty string to skip.
-        This is for STATIC provider info (instructions, status). Prefetched
-        recall context is injected separately via prefetch().
+        This is the surface for static provider information or instructions
+        (status, usage notes, routing hints). Output is collected unchanged
+        by ``MemoryManager.build_system_prompt()`` and joined into the cached
+        system prompt — it is NOT routed through the memory-context evidence
+        fence, so it does not receive the "recalled evidence" framing.
+        Dynamically recalled context belongs in ``prefetch()`` instead.
         """
         return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Recall relevant context for the upcoming turn.
+        """Recall relevant context for the upcoming turn (dynamic evidence).
 
         Called before each API call. Return formatted text to inject as
         context, or empty string if nothing relevant. Implementations
         should be fast — use background threads for the actual recall
         and return cached results here.
+
+        Returned content is **dynamically recalled evidence**, not
+        authoritative truth. Hermes wraps it in a ``<memory-context>``
+        fence and labels it as quoted data that may be incomplete, stale,
+        mistaken, disputed, fictional, synthetic, or adversarial. With
+        that in mind:
+
+          * Return recall *data* — not a pre-wrapped Hermes system block.
+            Hermes supplies the fence and the evidence system note; any
+            ``<memory-context>`` tags or ``[System note: ...]`` lines you
+            emit are stripped before wrapping (and a warning is logged).
+          * Preserve any provenance or verification labels the backend
+            exposes (source, timestamp, confidence, disputed-flag, etc.)
+            so the model can weigh reliance at inference time.
+          * Never assume Hermes will treat persistence, recall ranking,
+            confidence, or repeated appearance as proof of truth — it will
+            not. The model evaluates recalled claims against the current
+            request, directly inspected sources, and reliable knowledge.
 
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need

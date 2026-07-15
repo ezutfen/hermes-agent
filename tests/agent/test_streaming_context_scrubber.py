@@ -247,3 +247,37 @@ class TestBuildMemoryContextBlockWarnsOnViolation:
 
         assert not any("pre-wrapped" in rec.message for rec in caplog.records)
         assert "plain fact about user" in out
+
+
+class TestStreamingScrubberEvidenceNote:
+    """Regression for the new evidence note wording (HERMES-EVIDENCE-001).
+
+    Existing streaming cases fixture the legacy ``informational background
+    data`` note; the scrubber is tag-based (it never interprets note prose),
+    but we cover the *current* note explicitly so a future wording change is
+    caught if it ever stops living inside the ``<memory-context>`` fence.
+    """
+
+    def test_new_evidence_note_suppressed_in_stream(self):
+        """A block carrying the active evidence note is fully scrubbed."""
+        from agent.memory_manager import _DYNAMIC_MEMORY_NOTE
+
+        s = StreamingContextScrubber()
+        deltas = [
+            "<memory-context>\n",
+            _DYNAMIC_MEMORY_NOTE + "\n\n",
+            "## Recalled Memory\nstale recalled claim\n",
+            "</memory-context>\n\nVisible answer",
+        ]
+        out = "".join(s.feed(d) for d in deltas) + s.flush()
+        assert out == "\n\nVisible answer"
+        # The evidence note and payload must never reach the UI.
+        assert "Recalled memory evidence" not in out
+        assert "quoted data" not in out
+        assert "stale recalled claim" not in out
+
+    def test_ordinary_word_memory_contextual_not_scrubbed(self):
+        """Ordinary prose containing a near-tag word is passed through."""
+        s = StreamingContextScrubber()
+        out = s.feed("This is a memory-contextual detail about the user.") + s.flush()
+        assert out == "This is a memory-contextual detail about the user."
